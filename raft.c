@@ -47,74 +47,6 @@ static void __setProcessExiting(void) {
 /* A dict that maps client ID to MultiClientState structs */
 static RedisModuleDict *multiClientState = NULL;
 
-/* ------------------------------------ Command Classification ------------------------------------ */
-
-static RedisModuleDict *readonlyCommandDict = NULL;
-
-static void populateReadonlyCommandDict(RedisModuleCtx *ctx)
-{
-    static char *commands[] = {
-        "get",
-        "strlen",
-        "exists",
-        "getbit",
-        "getrange",
-        "substr",
-        "mget",
-        "llen",
-        "lindex",
-        "lrange",
-        "scard",
-        "sismember",
-        "srandmember",
-        "sinter",
-        "sunion",
-        "sdiff",
-        "smembers",
-        "sscan",
-        "zrange",
-        "zrangebyscore",
-        "zrevrangebyscore",
-        "zrangebylex",
-        "zrevrangebylex",
-        "zcount",
-        "zlexcount",
-        "zrevrange",
-        "zcard",
-        "zscore",
-        "zrank",
-        "zrevrank",
-        "zscan",
-        "hmget",
-        "hlen",
-        "hstrlen",
-        "hkeys",
-        "hvals",
-        "hgetall",
-        "hexists",
-        "hscan",
-        "randomkey",
-        "keys",
-        "scan",
-        "dbsize",
-        "ttl",
-        "bitcount",
-        "georadius_ro",
-        "georadiusbymember_ro",
-        "geohash",
-        "geopos",
-        "geodist",
-        "pfcount",
-        NULL
-    };
-
-    readonlyCommandDict = RedisModule_CreateDict(ctx);
-    int i;
-    for (i = 0; commands[i] != NULL; i++) {
-        RedisModule_DictSetC(readonlyCommandDict, commands[i], strlen(commands[i]), (void *) 0x01);
-    }
-}
-
 /* ------------------------------------ Common helpers ------------------------------------ */
 
 /* Set up a Raft log entry with an attached RaftReq. We use this when a user command provided
@@ -208,7 +140,7 @@ static void executeRaftRedisCommandArray(RaftRedisCommandArray *array,
             if (reply) {
                 RedisModule_ReplyWithCallReply(reply_ctx, reply);
             } else {
-                RedisModule_ReplyWithError(reply_ctx, "ERR Unknown command/arguments");
+                RedisModule_ReplyWithError(reply_ctx, "ERR Unknown command or wrong number of arguments");
             }
         }
 
@@ -322,7 +254,7 @@ static int raftSendRequestVote(raft_server_t *raft, void *user_data,
     Node *node = (Node *) raft_node_get_udata(raft_node);
 
     if (!ConnIsConnected(node->conn)) {
-        NODE_TRACE(node, "not connected, state=%s", NodeStateStr[node->state]);
+        NODE_TRACE(node, "not connected, state=%s", ConnGetStateStr(node->conn));
         return 0;
     }
 
@@ -399,13 +331,16 @@ static int raftSendAppendEntries(raft_server_t *raft, void *user_data,
     Node *node = (Node *) raft_node_get_udata(raft_node);
 
     int argc = 5 + msg->n_entries * 2;
-    char *argv[argc];
-    size_t argvlen[argc];
+    char **argv = NULL;
+    size_t *argvlen = NULL;
 
     if (!ConnIsConnected(node->conn)) {
-        NODE_TRACE(node, "not connected, state=%s", NodeStateStr[node->state]);
+        NODE_TRACE(node, "not connected, state=%s", ConnGetStateStr(node->conn));
         return 0;
     }
+
+    argv = RedisModule_Alloc(sizeof(argv[0]) * argc);
+    argvlen = RedisModule_Alloc(sizeof(argvlen[0]) * argc);
 
     char target_node_str[12];
     char source_node_str[12];
@@ -451,6 +386,10 @@ static int raftSendAppendEntries(raft_server_t *raft, void *user_data,
     for (i = 0; i < msg->n_entries; i++) {
         RedisModule_Free(argv[5 + i*2]);
     }
+
+    RedisModule_Free(argv);
+    RedisModule_Free(argvlen);
+
     return 0;
 }
 
@@ -1144,9 +1083,6 @@ RRStatus RedisRaftInit(RedisModuleCtx *ctx, RedisRaftCtx *rr, RedisRaftConfig *c
      */
     atexit(__setProcessExiting);
 
-    /* Populate Read-only command dict */
-    populateReadonlyCommandDict(ctx);
-
     /* Initialize uv loop */
     rr->loop = RedisModule_Alloc(sizeof(uv_loop_t));
     uv_loop_init(rr->loop);
@@ -1471,32 +1407,6 @@ exit:
     RaftReqFree(req);
 }
 
-static bool checkReadOnlyCommand(RedisModuleString *cmd)
-{
-    size_t cmd_len;
-    const char *cmd_str = RedisModule_StringPtrLen(cmd, &cmd_len);
-    char lcmd[cmd_len];
-
-    int i;
-    for (i = 0; i < cmd_len; i++) {
-        lcmd[i] = tolower(cmd_str[i]);
-    }
-
-    return RedisModule_DictGetC(readonlyCommandDict, lcmd, cmd_len, NULL) != NULL;
-}
-
-static bool checkReadOnlyCommandArray(RaftRedisCommandArray *array)
-{
-    int i;
-
-    for (i = 0; i < array->len; i++) {
-        if (!checkReadOnlyCommand(array->commands[i]->argv[0]))
-            return false;
-    }
-
-    return true;
-}
-
 /* Handle MULTI/EXEC transactions here.
  *
  * If this logic was applied, the request is freeed (if necessary) and the
@@ -1632,11 +1542,21 @@ static bool handleMultiExec(RedisRaftCtx *rr, RaftReq *req)
 
     /* Are we in MULTI? */
     if (multiState) {
-        /* TODO: Add command checks and set multiState->error if necessary; This probably requires
-         * Module API extensions.
+        /* We have to detct commands that are unsupported or must not be intercepted,
+         * and reject the transaction.
          */
-        RaftRedisCommandArrayMove(&multiState->cmds, &req->r.redis.cmds);
-        RedisModule_ReplyWithSimpleString(req->ctx, "QUEUED");
+        unsigned int cmd_flags = CommandSpecGetAggregateFlags(&req->r.redis.cmds, 0);
+
+        if (cmd_flags & CMD_SPEC_UNSUPPORTED) {
+            RedisModule_ReplyWithError(req->ctx, "ERR not supported by RedisRaft");
+            multiState->error = 1;
+        } else if (cmd_flags & CMD_SPEC_DONT_INTERCEPT) {
+            RedisModule_ReplyWithError(req->ctx, "ERR not supported by RedisRaft inside MULTI/EXEC");
+            multiState->error = 1;
+        } else {
+            RaftRedisCommandArrayMove(&multiState->cmds, &req->r.redis.cmds);
+            RedisModule_ReplyWithSimpleString(req->ctx, "QUEUED");
+        }
 
         RaftReqFree(req);
         return true;
@@ -1779,10 +1699,18 @@ static void handleRedisCommand(RedisRaftCtx *rr,RaftReq *req)
         goto exit;
     }
 
-    /* If command is read only we don't push it to the log, but queue it
-     * until we can confirm it's safe to execute (i.e. still a leader).
+    /* Handle the special case of read-only commands here: if quroum reads
+     * are enabled schedule the request to be processed when we have a guarantee
+     * we're still a leader. Otherwise, just process the reads.
+     *
+     * Normally we can expect a single command in the request, unless it is a
+     * MULTI/EXEC transaction in which case all queued commands are handled at once.
      */
-    if (checkReadOnlyCommandArray(&req->r.redis.cmds)) {
+    unsigned int cmd_flags = CommandSpecGetAggregateFlags(&req->r.redis.cmds, CMD_SPEC_WRITE);
+    if (cmd_flags & CMD_SPEC_UNSUPPORTED) {
+        RedisModule_ReplyWithError(req->ctx, "ERR not supported by RedisRaft");
+        goto exit;
+    } else if (cmd_flags & CMD_SPEC_READONLY && !(cmd_flags & CMD_SPEC_WRITE)) {
         if (rr->config->quorum_reads) {
             raft_queue_read_request(rr->raft, handleReadOnlyCommand, req);
         } else {
@@ -1846,6 +1774,10 @@ static void handleInfo(RedisRaftCtx *rr, RaftReq *req)
 
     raft_node_t *me = rr->raft ? raft_get_my_node(rr->raft) : NULL;
     s = catsnprintf(s, &slen,
+            "# RedisRaft\r\n"
+            "redisraft_version:%s\r\n"
+            "redisraft_git_sha1:%s\r\n"
+            "\r\n"
             "# Raft\r\n"
             "node_id:%d\r\n"
             "state:%s\r\n"
@@ -1855,6 +1787,8 @@ static void handleInfo(RedisRaftCtx *rr, RaftReq *req)
             "current_term:%d\r\n"
             "num_nodes:%d\r\n"
             "num_voting_nodes:%d\r\n",
+            REDISRAFT_VERSION,
+            REDISRAFT_GIT_SHA1,
             rr->config->id,
             getStateStr(rr),
             role,
@@ -1955,32 +1889,7 @@ exit:
     RaftReqFree(req);
 }
 
-static void handleClusterJoin(RedisRaftCtx *rr, RaftReq *req)
-{
-    if (checkRaftNotLoading(rr, req) == RR_ERROR) {
-        goto exit;
-    }
-
-    if (rr->state != REDIS_RAFT_UNINITIALIZED) {
-        RedisModule_ReplyWithError(req->ctx, "ERR Already cluster member");
-        goto exit;
-    }
-
-    /* Create a Snapshot Info meta-key */
-    initializeSnapshotInfo(rr);
-
-    /* Initiate cluster join */
-    InitiateJoinCluster(rr, req->r.cluster_join.addr);
-
-    rr->state = REDIS_RAFT_JOINING;
-
-    RedisModule_ReplyWithSimpleString(req->ctx, "OK");
-
-exit:
-    RaftReqFree(req);
-}
-
-void HandleClusterJoinCompleted(RedisRaftCtx *rr)
+void HandleClusterJoinCompleted(RedisRaftCtx *rr, RaftReq *req)
 {
     /* Initialize Raft log.  We delay this operation as we want to create the log
      * with the proper dbid which is only received now.
@@ -2002,6 +1911,9 @@ void HandleClusterJoinCompleted(RedisRaftCtx *rr)
     }
 
     rr->state = REDIS_RAFT_UP;
+
+    RedisModule_ReplyWithSimpleString(req->ctx, "OK");
+    RaftReqFree(req);
 }
 
 static void handleClientDisconnect(RedisRaftCtx *rr, RaftReq *req)

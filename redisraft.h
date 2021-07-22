@@ -27,6 +27,8 @@
 #include "redismodule.h"
 #include "raft.h"
 
+#include "version.h"
+
 #define UNUSED(x)   ((void) x)
 
 /* --------------- Forward declarations -------------- */
@@ -161,6 +163,7 @@ typedef struct Connection {
     long long last_connected_time;      /* Last connection time */
     unsigned long int connect_oks;      /* Successful connects */
     unsigned long int connect_errors;   /* Connection errors since last connection */
+    struct timeval timeout;             /* Timeout to use if not null */
     void *privdata;                     /* User provided pointer */
 
     /* Connect callback is guaranteed after ConnConnect(); Callback should check
@@ -270,9 +273,11 @@ extern RedisRaftCtx redis_raft;
 extern raft_log_impl_t RaftLogImpl;
 
 #define REDIS_RAFT_DEFAULT_LOG_FILENAME             "redisraft.db"
-#define REDIS_RAFT_DEFAULT_INTERVAL                 100
-#define REDIS_RAFT_DEFAULT_REQUEST_TIMEOUT          200
-#define REDIS_RAFT_DEFAULT_ELECTION_TIMEOUT         1000
+#define REDIS_RAFT_DEFAULT_INTERVAL                 100 /* usec */
+#define REDIS_RAFT_DEFAULT_REQUEST_TIMEOUT          200 /* usec */
+#define REDIS_RAFT_DEFAULT_ELECTION_TIMEOUT         1000 /* usec */
+#define REDIS_RAFT_DEFAULT_CONNECTION_TIMEOUT       3000 /* usec */
+#define REDIS_RAFT_DEFAULT_JOIN_TIMEOUT             120 /* seconds */
 #define REDIS_RAFT_DEFAULT_RECONNECT_INTERVAL       100
 #define REDIS_RAFT_DEFAULT_PROXY_RESPONSE_TIMEOUT   10000
 #define REDIS_RAFT_DEFAULT_RAFT_RESPONSE_TIMEOUT    1000
@@ -306,6 +311,8 @@ typedef struct RedisRaftConfig {
     int raft_interval;
     int request_timeout;
     int election_timeout;
+    int connection_timeout;
+    int join_timeout;
     int reconnect_interval;
     int proxy_response_timeout;
     int raft_response_timeout;
@@ -546,6 +553,20 @@ typedef struct SnapshotResult {
     char err[256];
 } SnapshotResult;
 
+/* Entry type for the internal command table used by RedisRaft,
+ * used to determine how different intercepted Redis commands are
+ * handled.
+ */
+typedef struct {
+    char *name;                 /* Command name */
+    unsigned int flags;         /* Command flags, see CMD_SPEC_* */
+} CommandSpec;
+
+#define CMD_SPEC_READONLY       (1<<1)      /* Command is a read-only command */
+#define CMD_SPEC_WRITE          (1<<2)      /* Command is a (potentially) write command */
+#define CMD_SPEC_UNSUPPORTED    (1<<3)      /* Command is not supported, should be rejected */
+#define CMD_SPEC_DONT_INTERCEPT (1<<4)      /* Command should not be intercepted to RAFT */
+
 /* Command filtering re-entrancy counter handling.
  *
  * This mechanism tracks calls from Redis Raft into Redis and used by the
@@ -573,7 +594,20 @@ static int inline checkInRedisModuleCall(void) {
     return redis_raft_in_rm_call;
 }
 
+typedef struct JoinLinkState {
+    NodeAddrListElement *addr;
+    NodeAddrListElement *addr_iter;
+    Connection *conn;
+    time_t start;                       /* Time we initiated the join, to enable it to fail if it takes too long */
+    RaftReq *req;                       /* Original RaftReq, so we can return a reply */
+    bool failed;                        /* unrecoverable failure */
+    char *type;                         /* error message to print if exhaust time */
+    ConnectionCallbackFunc connect_callback;
+} JoinLinkState;
+
 /* common.c */
+void joinLinkIdleCallback(Connection *conn);
+void joinLinkFreeCallback(void *privdata);
 const char *getStateStr(RedisRaftCtx *rr);
 const char *raft_logtype_str(int type);
 void replyRaftError(RedisModuleCtx *ctx, int error);
@@ -590,9 +624,6 @@ bool NodeAddrEqual(const NodeAddr *a1, const NodeAddr *a2);
 void NodeAddrListAddElement(NodeAddrListElement **head, const NodeAddr *addr);
 void NodeAddrListConcat(NodeAddrListElement **head, const NodeAddrListElement *other);
 void NodeAddrListFree(NodeAddrListElement *head);
-
-/* join.c */
-void InitiateJoinCluster(RedisRaftCtx *rr, const NodeAddrListElement *addr);
 
 /* node.c */
 Node *NodeCreate(RedisRaftCtx *rr, int id, const NodeAddr *addr);
@@ -612,8 +643,6 @@ void RaftRedisCommandArrayMove(RaftRedisCommandArray *target, RaftRedisCommandAr
 /* raft.c */
 RRStatus RedisRaftInit(RedisModuleCtx *ctx, RedisRaftCtx *rr, RedisRaftConfig *config);
 RRStatus RedisRaftStart(RedisModuleCtx *ctx, RedisRaftCtx *rr);
-void HandleClusterJoinCompleted(RedisRaftCtx *rr);
-
 void RaftReqFree(RaftReq *req);
 RaftReq *RaftReqInit(RedisModuleCtx *ctx, enum RaftReqType type);
 RaftReq *RaftDebugReqInit(RedisModuleCtx *ctx, enum RaftDebugReqType type);
@@ -727,5 +756,14 @@ void ShardingInfoRDBLoad(RedisModuleIO *rdb);
 void ShardingPeriodicCall(RedisRaftCtx *rr);
 RRStatus ShardGroupAppendLogEntry(RedisRaftCtx *rr, ShardGroup *sg, int type, void *user_data);
 void handleShardGroupLink(RedisRaftCtx *rr, RaftReq *req);
+
+/* join.c */
+void HandleClusterJoinCompleted(RedisRaftCtx *rr, RaftReq *pReq);
+void handleClusterJoin(RedisRaftCtx *rr, RaftReq *req);
+
+/* commands.c */
+RRStatus CommandSpecInit(RedisModuleCtx *ctx);
+unsigned int CommandSpecGetAggregateFlags(RaftRedisCommandArray *array, unsigned int default_flags);
+const CommandSpec *CommandSpecGet(const RedisModuleString *cmd);
 
 #endif  /* _REDISRAFT_H */

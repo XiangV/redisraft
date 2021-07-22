@@ -26,18 +26,17 @@
 #include <assert.h>
 #include "redisraft.h"
 
-typedef struct JoinState {
-    NodeAddrListElement *addr;
-    NodeAddrListElement *addr_iter;
-    Connection *conn;
-} JoinState;
+void HandleClusterJoinFailed(RedisRaftCtx *rr, RaftReq *req) {
+    RedisModule_ReplyWithError(req->ctx, "ERR Failed to join cluster, check logs");
+    RaftReqFree(req);
+}
 
 /* Callback for the RAFT.NODE ADD command.
  */
 static void handleNodeAddResponse(redisAsyncContext *c, void *r, void *privdata)
 {
     Connection *conn = privdata;
-    JoinState *state = ConnGetPrivateData(conn);
+    JoinLinkState *state = ConnGetPrivateData(conn);
     RedisRaftCtx *rr = ConnGetRedisRaftCtx(conn);
 
     redisReply *reply = r;
@@ -55,8 +54,11 @@ static void handleNodeAddResponse(redisAsyncContext *c, void *r, void *privdata)
                 LOG_VERBOSE("Join redirected to leader: %s:%d", addr.host, addr.port);
                 NodeAddrListAddElement(&state->addr, &addr);
             }
+        } else if (strlen(reply->str) > 12 && !strncmp(reply->str, "CLUSTERDOWN ", 12)) {
+            LOG_ERROR("RAFT.NODE ADD error: %s, retrying.", reply->str);
         } else {
             LOG_ERROR("RAFT.NODE ADD failed: %s", reply->str);
+            state->failed = true;
         }
     } else if (reply->type != REDIS_REPLY_ARRAY || reply->elements != 2) {
         LOG_ERROR("RAFT.NODE ADD invalid reply.");
@@ -70,7 +72,7 @@ static void handleNodeAddResponse(redisAsyncContext *c, void *r, void *privdata)
 
         rr->config->id = reply->element[0]->integer;
 
-        HandleClusterJoinCompleted(rr);
+        HandleClusterJoinCompleted(rr, state->req);
         assert(rr->state == REDIS_RAFT_UP);
 
         ConnAsyncTerminate(conn);
@@ -102,58 +104,39 @@ static void sendNodeAddRequest(Connection *conn)
     }
 }
 
-/* Invoked when the connection is terminated.
- */
-void joinFreeCallback(void *privdata)
+void handleClusterJoin(RedisRaftCtx *rr, RaftReq *req)
 {
-    JoinState *state = (JoinState *) privdata;
+    const char * type = "join";
 
-    NodeAddrListFree(state->addr);
-    RedisModule_Free(state);
-}
-
-/* Invoked when the connection is not connected or actively attempting
- * a connection.
- */
-void joinIdleCallback(Connection *conn)
-{
-    JoinState *state = ConnGetPrivateData(conn);
-
-    /* Advance iterator, wrap around to start */
-    if (state->addr_iter) {
-        state->addr_iter = state->addr_iter->next;
-    }
-    if (!state->addr_iter) {
-        state->addr_iter = state->addr;
-
-        /* FIXME: If we iterated through the entire list, we currently continue
-         * forever. This should be changed along with the change of configuration
-         * interface, so once we've exahusted all addresses we fail the
-         * join operation.
-         */
+    if (checkRaftNotLoading(rr, req) == RR_ERROR) {
+        goto exit_fail;
     }
 
-    LOG_VERBOSE("Joining cluster, connecting to %s:%u",
-            state->addr_iter->addr.host, state->addr_iter->addr.port);
+    if (rr->state != REDIS_RAFT_UNINITIALIZED) {
+        RedisModule_ReplyWithError(req->ctx, "ERR Already cluster member");
+        goto exit_fail;
+    }
 
-    /* Establish connection. We silently ignore errors here as we'll
-     * just get iterated again in the future.
-     */
-    ConnConnect(state->conn, &state->addr_iter->addr, sendNodeAddRequest);
-}
+    /* Create a Snapshot Info meta-key */
+    initializeSnapshotInfo(rr);
 
-/* Initiate the process of joining a cluster, using the specified list
- * of addresses.
- */
-
-void InitiateJoinCluster(RedisRaftCtx *rr, const NodeAddrListElement *addr)
-{
-    JoinState *state = RedisModule_Calloc(1, sizeof(*state));
-    NodeAddrListConcat(&state->addr, addr);
+    JoinLinkState *state = RedisModule_Calloc(1, sizeof(*state));
+    state->type = RedisModule_Calloc(1, strlen(type)+1);
+    strcpy(state->type, type);
+    state->connect_callback = sendNodeAddRequest;
+    time(&(state->start));
+    NodeAddrListConcat(&state->addr, req->r.cluster_join.addr);
+    state->req = req;
 
     /* We just create the connection with an idle callback, which will
      * shortly fire and handle connection setup.
-     */ 
-    state->conn = ConnCreate(rr, state, joinIdleCallback, joinFreeCallback);
-}
+     */
+    state->conn = ConnCreate(rr, state, joinLinkIdleCallback, joinLinkFreeCallback);
 
+    rr->state = REDIS_RAFT_JOINING;
+
+    return;
+
+exit_fail:
+    RaftReqFree(req);
+}

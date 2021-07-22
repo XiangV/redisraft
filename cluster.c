@@ -325,7 +325,7 @@ static void handleShardGroupResponse(redisAsyncContext *c, void *r, void *privda
         if (parseShardGroupReply(reply, &recv_sg) == RR_ERROR) {
             LOG_ERROR("RAFT.SHARDGROUP GET invalid reply.");
         } else {
-            LOG_INFO("Received shardgroup reply for %u!", sg->id);
+            LOG_DEBUG("Received shardgroup %u reply.", sg->id);
             sg->use_conn_addr = true;
             sg->last_updated = RedisModule_Milliseconds();
             sg->update_in_progress = false;
@@ -398,6 +398,7 @@ static void establishShardGroupConn(Connection *conn)
             sg->node_conn_idx = 0;
         }
         addr = &sg->nodes[sg->node_conn_idx++].addr;
+        sg->conn_addr = *addr;
     }
 
     LOG_DEBUG("Initiating shardgroup(%u) connection to %s:%u", sg->id, addr->host, addr->port);
@@ -954,36 +955,6 @@ exit:
  * ShardGroup Link Implementation
  * -------------------------------------------------------------------------- */
 
-/* The state we track when performing a RAFT.SHARDGROUP LINK operation.
- * It is short lived until the operation is complete and a response is
- * returned to the user.
- */
-typedef struct ShardGroupLinkState {
-    NodeAddrListElement *addr;          /* Address list to try */
-    NodeAddrListElement *addr_iter;     /* Current iterator in list */
-    Connection *conn;                   /* Connection we use */
-    RaftReq *req;                       /* Original RaftReq, so we can return a reply */
-} ShardGroupLinkState;
-
-/* Free a ShardGroupLinkState structure.
- */
-static void linkFree(void *privdata)
-{
-    ShardGroupLinkState *state = privdata;
-
-    NodeAddrListFree(state->addr);
-    if (state->req) {
-        /* Normally a reply is returned and this should be NULL. If it is not,
-         * we need to reply something before freeing as the client is still blocking.
-         */
-        RedisModule_ReplyWithError(state->req->ctx, "operation failed, please consult the logs.");
-        RaftReqFree(state->req);
-        state->req = NULL;
-    }
-
-    RedisModule_Free(state);
-}
-
 /* Handle the received RAFT.SHARDGROUP GET reply from the remote cluster.
  *
  * Basically, just parse, validate and submit as RAFT_LOGTYPE_SHARDGROUP_ADD
@@ -997,7 +968,7 @@ static void linkHandleResponse(redisAsyncContext *c, void *r, void *privdata)
     redisReply *reply = r;
     Connection *conn = (Connection *) privdata;
     RedisRaftCtx *rr = ConnGetRedisRaftCtx(conn);
-    ShardGroupLinkState *state = ConnGetPrivateData(conn);
+    JoinLinkState *state = ConnGetPrivateData(conn);
 
     if (!reply) {
         LOG_ERROR("RAFT.SHARDGROUP GET failed: connection dropped.");
@@ -1014,6 +985,7 @@ static void linkHandleResponse(redisAsyncContext *c, void *r, void *privdata)
             }
         } else {
             LOG_ERROR("RAFT.SHARDGROUP GET failed: %s", reply->str);
+
         }
     } else {
         ShardGroup recv_sg;
@@ -1025,6 +997,7 @@ static void linkHandleResponse(redisAsyncContext *c, void *r, void *privdata)
             /* Validate */
             if (ShardingInfoValidateShardGroup(rr, &recv_sg) != RR_OK) {
                 LOG_ERROR("Received shardgroup failed validation!");
+                state->failed = true;
             } else {
                 LOG_VERBOSE("Shardgroup link: %s:%u: received configuration, propagating to Raft log.",
                             state->addr_iter->addr.host, state->addr_iter->addr.port);
@@ -1057,7 +1030,7 @@ static void linkSendRequest(Connection *conn)
         return;
     }
 
-    ShardGroupLinkState *state = ConnGetPrivateData(conn);
+    JoinLinkState *state = ConnGetPrivateData(conn);
     LOG_VERBOSE("Shardgroup link %s:%u: connected, requesting configuration",
                 state->addr_iter->addr.host,
                 state->addr_iter->addr.port);
@@ -1075,71 +1048,34 @@ static void linkSendRequest(Connection *conn)
     /* We'll be back with handleShardGroupResponse */
 }
 
-/* Establish a connection with the remote cluster to deliver a RAFT.SHARDGROUP GET
- * request.
- *
- * We use addr and addr_iter to handle iteration through multiple addresses.
- * Normally, we should have only a single address which is specified by the suer.
- * However, if a -MOVED reply is received we append it here and initiate a retry
- * (which may, although not likely, happen several times).
- */
-
-static void linkConnect(Connection *conn)
-{
-    ShardGroupLinkState *state = ConnGetPrivateData(conn);
-
-    /* First iteration? */
-    if (!state->addr_iter) {
-        state->addr_iter = state->addr;
-    } else {
-        /* Try next address */
-        state->addr_iter = state->addr_iter->next;
-    }
-
-    /* If all attempts were exhausted, abort. */
-    if (!state->addr_iter) {
-        /* Nothing else to try? */
-        RedisModule_ReplyWithError(state->req->ctx, "failed to link, please check the logs.");
-
-        /* Release client */
-        RaftReqFree(state->req);
-        state->req = NULL;
-
-        ConnAsyncTerminate(conn);
-        return;
-    }
-
-    LOG_VERBOSE("Shardgroup link: connecting to %s:%u",
-                state->addr_iter->addr.host, state->addr_iter->addr.port);
-
-    /* Establish connection. We silently ignore errors here as we'll
-     * just get iterated again in the future.
-     */
-    ConnConnect(state->conn, &state->addr_iter->addr, linkSendRequest);
-}
-
 /* Handle a RAFT.SHARDGROUP LINK request.
  */
 void handleShardGroupLink(RedisRaftCtx *rr, RaftReq *req)
 {
+    const char * type = "link";
+
     /* Must be done on a leader */
     if (checkRaftState(rr, req) == RR_ERROR ||
         checkLeader(rr, req, NULL) == RR_ERROR) {
-        goto exit;
+        goto exit_fail;
     }
 
     LOG_INFO("Attempting to link shardgroup %s:%u",
              req->r.shardgroup_link.addr.host,
              req->r.shardgroup_link.addr.port);
 
-    ShardGroupLinkState *state = RedisModule_Calloc(1, sizeof(ShardGroupLinkState));
+    JoinLinkState *state = RedisModule_Calloc(1, sizeof(*state));
+    state->type = RedisModule_Calloc(1, strlen(type)+1);
+    strcpy(state->type, type);
+    state->connect_callback = linkSendRequest;
+    time(&(state->start));
     NodeAddrListAddElement(&state->addr, &req->r.shardgroup_link.addr);
     state->req = req;
-    state->conn = ConnCreate(rr, state, linkConnect, linkFree);
+
+    state->conn = ConnCreate(rr, state, joinLinkIdleCallback, joinLinkFreeCallback);
 
     return;
-
-exit:
+exit_fail:
     RaftReqFree(req);
 
 }
